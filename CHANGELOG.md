@@ -1,5 +1,16 @@
 # 变更记录
 
+## v1.0.21 — 2026-10-29
+- **修 `detectStatus` 的 KSUV_CACHE 坑**：原写法把字面量 `\${ksuAppVersion}` 传给 shell，
+  变量恒为空 ⇒ `[ -z "$KSUV_CACHE" ]` 永远为真 ⇒ 每次探测都白跑一次重型 `dumpsys package`。
+  现由 Dart 侧把已知版本注入 `KSUV_CACHE`，短路才真正生效（空闲期开销更小）。
+- **删模板遗留的 `test/widget_test.dart`**：引用不存在的 `MyApp`，`flutter analyze` 恒有一个
+  error、`flutter test` 恒红；有意义的测试在 `updater_test.dart`。
+- **清 analyzer 警告**：删 chain.dart 未用的 `IOSink` 导入、`_lastStartAt` 字段、
+  `_tempGateTries` 常量；删 shizuku.dart 多余的 `dart:typed_data` 导入；
+  main.dart 对 `chain.notifyListeners()` 的 protected 越权调用改为新增的公共方法
+  `RootChain.notifyUi()`。`flutter analyze` 现在无 error 无 warning（剩 info 级风格项，未动）。
+
 ## v1.0.20 — 2026-10-29
 - **沉浸式系统栏（用户反馈：底部手势条区域是白色安全边距，看着别扭）**：
   `main()` 里开 `SystemUiMode.edgeToEdge`，状态栏/导航栏全透明 + 亮色图标/手势条，

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io' show IOSink;
 import 'dart:convert';
 import 'dart:io' show File, FileMode, gzip;
 import 'dart:typed_data';
@@ -130,7 +129,6 @@ class RootChain extends ChangeNotifier {
   //   · 一轮结束后进入冷却：成功 0s / 失败 90s / 疑似重启 180s
   DateTime? _lastEndAt;
   bool _lastRunFailed = false;
-  DateTime? _lastStartAt;
   static const int _coolDownFailSec = 90;
   static const int _coolDownPanicSec = 180;
 
@@ -454,6 +452,10 @@ class RootChain extends ChangeNotifier {
 
   /// 其它界面（更新检查等）写日志：同样走统一管道（批量化落盘 + 800 行裁剪）
   void addLog(String l) => _log(l);
+
+  /// 供 UI 层在改了 chain 的公开字段后手动触发刷新
+  /// （`notifyListeners` 是 ChangeNotifier 的 protected 成员，外部直调属于误用）
+  void notifyUi() => notifyListeners();
 
   void _flushLog() {
     final f = _logFile;
@@ -1025,7 +1027,6 @@ class RootChain extends ChangeNotifier {
       _log('[start] 冷却中（还需 ${startCooldownLeft}s）：连点/连跑只会让设备反复重启升温');
       return;
     }
-    _lastStartAt = DateTime.now();
     _rebootSeenInRun = false;
     _carrierEpermStreak = 0;
     _carrierEpermSeen = false;
@@ -1307,8 +1308,10 @@ class RootChain extends ChangeNotifier {
     await restoreLeftoverOptions();
     skipReason.clear();
     alreadyRooted = false;
+    // 已知管理器版本时由 Dart 侧注入，shell 里的 [ -z "$KSUV_CACHE" ] 才能真正短路掉
+    // dumpsys package（原写法把字面量 ${ksuAppVersion} 传给 shell ⇒ 恒为空 ⇒ dumpsys 每次都跑）。
     final r = await ShizukuShell.run(
-        'KSUV_CACHE="\${ksuAppVersion}"; export KSUV_CACHE; '
+        'KSUV_CACHE="$ksuAppVersion"; export KSUV_CACHE; '
         r'echo ENF=$(getenforce 2>/dev/null);'
         r' echo KSU=$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0);'
         r' echo MODS=$(grep -cE "^(pwnm|pwn3|pwnf)" /proc/modules 2>/dev/null || echo 0);'
@@ -2257,7 +2260,6 @@ class RootChain extends ChangeNotifier {
       optParamSet == ParamSet.classic ? kPrePipesClassic : kPrePipesModern;
   static const int _tempBestMc = 40000;    // ≤40 最佳
   static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
-  static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟
 
   /// 温度分档（UI 与日志共用）：0=最佳 1=可用 2=偏高
   static int tempTier(int mC) => mC <= _tempBestMc ? 0 : (mC <= _tempOkMc ? 1 : 2);

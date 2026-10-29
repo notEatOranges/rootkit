@@ -1495,7 +1495,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (ok != true) return;
 
     chain.logs.add('[reboot] 正在重启（正常 reboot）…');
-    chain.notifyListeners();
+    chain.notifyUi();
     // 先把能恢复的恢复（有 root shell 时让模块修 initialized），再 reboot
     await ShizukuShell.run(
       'echo "chmod 755 /data/local/tmp/rk/module.ko 2>/dev/null; '

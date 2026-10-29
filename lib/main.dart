@@ -1283,6 +1283,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   SwitchListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                    value: chain.optAdbPulse,
+                    title: const Text('⚗ 实验性：跑链保活心跳',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('每 20s 发一条轻量只读命令（模拟 PC 侧 adb 监听）'
+                        '，包括开打期间。n=2 未验证，与「跑链期静默」相反；'
+                        '开启后每发 meta.log 打 hb=1，用于 A/B 归因',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(adbPulse: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     value: chain.optCleanup,
                     title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
                     subtitle: const Text('停掉 root shell、删掉 /data/local/tmp/rk 里的文件。'

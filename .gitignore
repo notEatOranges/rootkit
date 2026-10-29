@@ -41,3 +41,4 @@ android/keystore/
 assets/qr_*.real.png
 /ci/
 logsnapshots/
+*.apk

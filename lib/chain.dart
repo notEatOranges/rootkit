@@ -174,6 +174,16 @@ class RootChain extends ChangeNotifier {
   bool optDim = true;
   static const int kDimBrightness = 1;
 
+  /// 【实验性，默认关】跑链期间每 20s 发一条 PC 侧 adb 式轻量只读命令
+  /// （`getenforce` + `uptime`，不分配内存、不碰 binder 大事务）。
+  ///
+  /// 来源：2026-10-29 BKQ-AN10 上，唯一一轮开着 PC 侧 adb 心跳的链三连命中 0 panic；
+  /// 但无监听的轮也有成功（次日 23:5x），n=2 不能定论 ⇒ 只作为可开关、可打标的实验项。
+  /// 假设：周期性轻活动把 CPU 从深 idle 拉出来（与文档 Dozing→0/N、Awake→4/5 同族效应）。
+  /// 与 v1.0.17「跑链期静默」不矛盾——那边是 Shizuku 侧重型轮询（dumpsys/slabinfo），
+  /// 这里是只读轻命令；但方向未经 A/B 证实，开了就是在参与实验（数据记进 meta.log 的 hb=）。
+  bool optAdbPulse = false;
+
   Future<void> loadOptions() async {
     final a = await ShizukuShell.getPref('opt.wifiOff');
     final b = await ShizukuShell.getPref('opt.tap');
@@ -196,12 +206,14 @@ class RootChain extends ChangeNotifier {
     }
     final g2 = await ShizukuShell.getPref('opt.dim');
     if (g2 != null) optDim = g2 == '1';
+    final i2 = await ShizukuShell.getPref('opt.adbPulse');
+    if (i2 != null) optAdbPulse = i2 == '1';
     notifyListeners();
   }
 
   Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup,
       bool? killBg, TempGate? tempGate, bool? dim, ParamSet? paramSet,
-      bool? updateCheck}) async {
+      bool? updateCheck, bool? adbPulse}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -238,6 +250,10 @@ class RootChain extends ChangeNotifier {
     if (dim != null) {
       optDim = dim;
       await ShizukuShell.setPref('opt.dim', dim ? '1' : '0');
+    }
+    if (adbPulse != null) {
+      optAdbPulse = adbPulse;
+      await ShizukuShell.setPref('opt.adbPulse', adbPulse ? '1' : '0');
     }
     _advice();
     notifyListeners();
@@ -1028,24 +1044,31 @@ class RootChain extends ChangeNotifier {
     _advice();
     notifyListeners();
 
-    // 心跳（v1.0.18 重写）：
-    // 旧实现每 20s 跑 _prepCmd()（input tap + 4 条 settings put）+ refreshHealth(force: true)
-    // （dumpsys power + slabinfo + meminfo + getenforce + /proc/modules + ls×4）。
-    // force 标志恰好绕过了 v1.0.17 给 refreshHealth 加的 running 早退 ⇒ 等于跑链期间
-    // 仍在做重型轮询，与 CHANGELOG v1.0.17「跑链期间彻底静默」的结论自相矛盾。
-    // 一发 shot 50–200s，20s 心跳必然落进竞态窗口 2–10 次；这类重活在窗口里反复
-    // 分配/持锁，把 UAF 释放的页重新占用 ⇒ panic（3s/5s 节奏实测把 panic 从 12% 推到 100%）。
-    // 现在：
-    //   · shot 在飞 ⇒ 什么都不做（零 shell 流量）；
-    //   · shot 间隙 ⇒ 只发一条 input keyevent 224 保活。常亮/亮度/30min 超时在开局与
-    //     每发前的 prep 里已设置，覆盖整轮，无需反复写 settings，更不需要 tap。
+    // 心跳（v1.0.19 起双模式）：
+    // · optAdbPulse=on（实验）：每 20s 发一条 PC 侧 adb 式轻量只读命令
+    //   （getenforce + uptime），**包括 shot 进行中**——忠实复现 2026-10-29 那轮
+    //   三连命中的监听模式。未验证（n=2），每发会在 meta.log 打 hb=1 供事后归因。
+    // · optAdbPulse=off（默认，v1.0.18 行为）：shot 在飞 ⇒ 什么都不发（零 shell 流量）；
+    //   shot 间隙 ⇒ 只发一条 input keyevent 224 保活。
     _heartbeat = Timer.periodic(const Duration(seconds: 20), (_) async {
-      if (!running || _shotInFlight) return;
+      if (!running) return;
+      if (optAdbPulse) {
+        // 忠实复现 2026-10-29 成功轮的 PC 侧监听命令（同一条、同节奏）
+        await ShizukuShell.run(
+            'getenforce 2>/dev/null; cut -d. -f1 /proc/uptime 2>/dev/null');
+        return;
+      }
+      if (_shotInFlight) return;
       await ShizukuShell.run('input keyevent 224 2>/dev/null');
     });
 
     try {
       bootId = await _bootId();
+      if (optAdbPulse) {
+        _log('[pulse] ⚗ 实验性心跳已启用：跑链期间每 20s 发一条轻量只读命令'
+            '（复现 2026-10-29 PC 侧监听模式，n=2 未验证）；'
+            '每发 meta.log 会打 hb=1，供 A/B 归因');
+      }
       await _snapshotOptions(); // 先记录原值，运行结束/成功后可原样恢复
       await refreshHealth(force: true);
       // 探测现状（决定哪些阶段可直接跳过）
@@ -2293,6 +2316,7 @@ class RootChain extends ChangeNotifier {
     final t = readTempMc();
     final r = await ShizukuShell.run(
         'echo "stage=$stage param=${optParamSet.name} pre_pipes=$prePipes temp_mc=$t '
+        'hb=${optAdbPulse ? 1 : 0} '
         'uptime=\$(cut -d. -f1 /proc/uptime) '
         'memfree=\$(grep MemFree /proc/meminfo | tr -s " " | cut -d" " -f2) '
         'procs=\$(ls /proc | grep -cE "^[0-9]") '

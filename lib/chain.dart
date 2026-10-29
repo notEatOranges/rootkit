@@ -111,6 +111,18 @@ class RootChain extends ChangeNotifier {
   Timer? _healthTimer;                        // 5s 主动刷新状态区
   bool _healthBusy = false;                   // 防重入
 
+  // ---- 跑链期间的静默纪律（v1.0.18）----
+  /// 一发 exploit 在飞（x645 进程活着）⇒ 心跳连保活命令都不发，零 shell 流量。
+  /// 依据：CHANGELOG v1.0.17 的 panic 分析——竞态窗口里任何额外的 binder/shell 活动
+  /// 都会把 UAF 释放的页重新占用，推高 panic 率。
+  bool _shotInFlight = false;
+  /// 本轮「F_SETPIPE_SZ=EPERM（载体退化）」的连续发生数（permissive 重试守卫用）
+  int _carrierEpermStreak = 0;
+  /// 本轮是否出现过载体 EPERM（给建议引擎用）
+  bool _carrierEpermSeen = false;
+  /// 最近一次环境探针读到的进程数（给建议引擎用）
+  int _lastProbeProcCount = 0;
+
   // ---- 连点/连跑保护 ----
   // 用户实测：连点"开始"会让设备连续重启，每次 panic 重启都在重新加热；
   // 而且一轮跑完后立刻再点，命中率显著更差。所以：
@@ -814,6 +826,15 @@ class RootChain extends ChangeNotifier {
       suggestions.add('已开启「关 WiFi/蓝牙」：命中率更高，但重启后要重新打开 WiFi、'
           '重新开启开发者选项里的「无线调试」才能启动 Shizuku（或用电脑 adb 启动）。');
     }
+    // v1.0.18：两条针对性建议（来源：2026-10-29 真机日志复盘）
+    if (_carrierEpermSeen) {
+      suggestions.add('本轮出现过 F_SETPIPE_SZ=EPERM（uid 2000 管道页预算被占，512KB 载体退化）：'
+          '重启设备释放预算最彻底；日常预防可在选项里开「开打前清理后台」。');
+    }
+    if (_lastProbeProcCount >= 1000) {
+      suggestions.add('后台进程 $_lastProbeProcCount 个偏多（内存前三常是微信等大户）：'
+          '管道页预算与页回收都会被挤，可在选项里打开「开打前清理后台」再跑。');
+    }
     if (suggestions.isEmpty) {
       suggestions.add(running
           ? '正在执行，保持屏幕常亮；单轮约 3–5 分钟。'
@@ -965,6 +986,21 @@ class RootChain extends ChangeNotifier {
     return out;
   }
 
+  /// 载体自检（v1.0.18）：原生日志里出现 `F_SETPIPE_SZ=-1` ⇒ 512KB 管道载体没建起来
+  /// （uid 2000 的 64MB 管道页预算被占，EPERM），载体退化成 8KB 小管道 ⇒ 这一发几乎必 miss。
+  /// 这是 docs/04-benchmark.md §7 点名的「静默退化」：不查它，就会把它当普通 miss
+  /// 继续原样重试——条件完全相同，每一发都白发（还各背 ~14% panic 风险）。
+  /// 返回 true = 本发载体 EPERM。
+  bool _carrierCheck(String nativeLog, {required String tag}) {
+    if (!nativeLog.contains('F_SETPIPE_SZ=-1')) return false;
+    _carrierEpermSeen = true;
+    _log('[carrier:$tag] ⚠ 本发 F_SETPIPE_SZ=EPERM：512KB 载体没建起来（uid 2000 管道页预算被占），'
+        '退化成 8KB 小管道 ⇒ 落位近乎必败（docs/04-benchmark.md §7）。'
+        '对策：① 选项里开「开打前清理后台」；② 清掉微信等占内存大户；③ 重启设备释放预算（最彻底）。');
+    _advice();
+    return true;
+  }
+
   // ---------------------------------------------------------------- 主流程
 
   Future<void> start() async {
@@ -975,6 +1011,8 @@ class RootChain extends ChangeNotifier {
     }
     _lastStartAt = DateTime.now();
     _rebootSeenInRun = false;
+    _carrierEpermStreak = 0;
+    _carrierEpermSeen = false;
     running = true;
     _stop = false;
     lastError = null;
@@ -990,11 +1028,20 @@ class RootChain extends ChangeNotifier {
     _advice();
     notifyListeners();
 
-    // 心跳：更新耗时/保持屏幕
+    // 心跳（v1.0.18 重写）：
+    // 旧实现每 20s 跑 _prepCmd()（input tap + 4 条 settings put）+ refreshHealth(force: true)
+    // （dumpsys power + slabinfo + meminfo + getenforce + /proc/modules + ls×4）。
+    // force 标志恰好绕过了 v1.0.17 给 refreshHealth 加的 running 早退 ⇒ 等于跑链期间
+    // 仍在做重型轮询，与 CHANGELOG v1.0.17「跑链期间彻底静默」的结论自相矛盾。
+    // 一发 shot 50–200s，20s 心跳必然落进竞态窗口 2–10 次；这类重活在窗口里反复
+    // 分配/持锁，把 UAF 释放的页重新占用 ⇒ panic（3s/5s 节奏实测把 panic 从 12% 推到 100%）。
+    // 现在：
+    //   · shot 在飞 ⇒ 什么都不做（零 shell 流量）；
+    //   · shot 间隙 ⇒ 只发一条 input keyevent 224 保活。常亮/亮度/30min 超时在开局与
+    //     每发前的 prep 里已设置，覆盖整轮，无需反复写 settings，更不需要 tap。
     _heartbeat = Timer.periodic(const Duration(seconds: 20), (_) async {
-      if (!running) return;
-      await ShizukuShell.run(_prepCmd());
-      await refreshHealth(force: true);
+      if (!running || _shotInFlight) return;
+      await ShizukuShell.run('input keyevent 224 2>/dev/null');
     });
 
     try {
@@ -1456,10 +1503,15 @@ class RootChain extends ChangeNotifier {
       await _shotMeta('permissive');
       _log('[permissive] run ${run + 1}: 开打（约 30–60s）'
           ' 参数集=${optParamSet.name}（PRE_PIPES=$prePipes）');
+      _shotInFlight = true;
+      // ShizukuShell.run 内部捕获所有异常（返回 code=-1），不会抛 ⇒ 无需 try/finally。
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',
-        timeoutMs: 300000,
+        // STAGE_TRIES=4 ≈ 115s 名义耗时；热机降频会拉长，360s 给足裕量，
+        // 避免慢发在竞态中途被 Shizuku 通道 destroy。
+        timeoutMs: 360000,
       );
+      _shotInFlight = false;
       _log(r.all);
       final lg = await ShizukuShell.run('cat $logPath 2>/dev/null');
       _countTries(lg.out);
@@ -1475,6 +1527,22 @@ class RootChain extends ChangeNotifier {
         lastError = '设备已重启（命中后延迟 panic）。等桌面恢复后点「重启」做一次正常重启，再重新运行';
         _stop = true;
         return;
+      }
+      // 载体自检：EPERM 连续 ≥2 发 ⇒ 条件不会自己变好，别再烧剩下的发数
+      //（每发 ~14% panic 风险，docs §6.2）。留 1 发余量给「上一发残留管道未释放」的瞬态。
+      if (_carrierCheck(lg.out, tag: 'permissive')) {
+        _carrierEpermStreak++;
+        if (_carrierEpermStreak >= 2) {
+          _stage(StageId.permissive, StageStatus.failed, detail: '载体连续 EPERM');
+          lastError = '连续 $_carrierEpermStreak 发 F_SETPIPE_SZ=EPERM：管道页预算被占，'
+              '512KB 载体建不起来，原地重试没有意义。重启设备释放预算（最稳），'
+              '或开「开打前清理后台」+ 清掉微信等大户后再跑。';
+          _stop = true;
+          _advice();
+          return;
+        }
+      } else {
+        _carrierEpermStreak = 0;
       }
       _advice();
     }
@@ -1680,6 +1748,14 @@ class RootChain extends ChangeNotifier {
     return false;
   }
 
+  /// 判据生产者（pc）还活着吗。它只在链首被拉起、链尾才清（_killStrays withPc），
+  /// 中途任何一个阶段发现它没了，后续所有 verdict（CAPBND_ZERO/CAPEFF_OK/ROOT_OK）
+  /// 都不可能再出现。
+  Future<bool> _pcAlive() async {
+    final r = await ShizukuShell.run('pgrep -x pc 2>/dev/null | wc -l');
+    return (int.tryParse(r.out.trim()) ?? 0) > 0;
+  }
+
   Future<void> _runProbe() async {
     _stage(StageId.probe, StageStatus.running);
     phase = '候选进程';
@@ -1729,7 +1805,7 @@ class RootChain extends ChangeNotifier {
     required int stageFrom,
     required int tries,
     String? tryList,
-    int timeoutMs = 300000,
+    int timeoutMs = 360000,
   }) async {
     final s = _byId[stage]!;
     s.runs++;
@@ -1750,10 +1826,14 @@ class RootChain extends ChangeNotifier {
     await _shotMeta(stage.name);
     _log('[${stage.name}] 开打 tries=$tries 参数集=${optParamSet.name}'
         '（PRE_PIPES=$prePipes PIPE512=64 PIPE_K=4 THRESH=32）');
+    _shotInFlight = true;
+    // STAGE_TRIES=8 ≈ 200s 名义耗时（docs §8.1：try=0 约 50s，每次内部重试 +21s），
+    // 热机降频还会拉长；360s 避免慢发在竞态中途被 destroy（旧值 300s 贴着上限）。
     final r = await ShizukuShell.run(
       'cd $workDir && $env ./x645 2>&1; echo "RC=\$?"',
       timeoutMs: timeoutMs,
     );
+    _shotInFlight = false;
     if (r.all.isNotEmpty) _log(r.all);
     // ★ 每发打完都用 -9 清一遍：载荷的 exec 竞速会留下大量同名子进程，
     // 原来的 `pkill -x x645`（SIGTERM）杀不掉它们，实测会累积到 300 个，
@@ -1761,6 +1841,7 @@ class RootChain extends ChangeNotifier {
     // 之后每一发都在"热机 + 预算耗尽"的条件下开打，命中率断崖下跌。
     await _killStrays();
     final lg = await ShizukuShell.run('cat $logPath 2>/dev/null');
+    _carrierCheck(lg.out, tag: stage.name);
     return lg.out;
   }
 
@@ -1799,11 +1880,21 @@ class RootChain extends ChangeNotifier {
         tryList: targets,
       );
       _countTries(lg, phase1OrPhase2: StageId.phase1);
-      final v = await _pollVerdict('CAPBND_ZERO', 60);
+      final v = await _pollVerdict('CAPBND_ZERO', 90);
       if (v != null) {
         s.hits = s.hits == 0 ? 1 : s.hits;
         _log('[phase1] HIT: $v');
         _stage(StageId.phase1, StageStatus.ok, detail: v);
+        _advice();
+        return;
+      }
+      // verdict 没等到 ⇒ 先看判据生产者还活着没（v1.0.18）。
+      // pc 是 CAPBND_ZERO/CAPEFF_OK/ROOT_OK 的唯一打印者兼模块加载者（docs §9.2 的坑）：
+      // 它若退出，继续重打永远拿不到判据，只会白白发（每发 ~14% panic 风险）。
+      if (!await _pcAlive()) {
+        _stage(StageId.phase1, StageStatus.failed, detail: '判据进程 pc 已退出');
+        lastError = 'probe（pc）已退出：它负责打印 CAPBND_ZERO / ROOT_OK 并加载模块，'
+            '它没了即使写成功也拿不到结果。重新点「开始」即可（② 会重启探针）。';
         _advice();
         return;
       }
@@ -1868,6 +1959,14 @@ class RootChain extends ChangeNotifier {
         s.hits = s.hits == 0 ? 1 : s.hits;
         _log('[phase2] HIT: $v');
         _stage(StageId.phase2, StageStatus.ok, detail: v);
+        _advice();
+        return;
+      }
+      // 同 phase1：判据生产者没了就别再打（v1.0.18）
+      if (!await _pcAlive()) {
+        _stage(StageId.phase2, StageStatus.failed, detail: '判据进程 pc 已退出');
+        lastError = 'probe（pc）已退出：它负责打印 CAPEFF_OK / ROOT_OK 并加载模块，'
+            '它没了即使写成功也拿不到结果。重新点「开始」即可（② 会重启探针）。';
         _advice();
         return;
       }
@@ -2075,6 +2174,7 @@ class RootChain extends ChangeNotifier {
         if (i > 0) m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
       }
       final wake = m['W'] ?? '';
+      _lastProbeProcCount = int.tryParse(m['NPROC'] ?? '') ?? 0;
       _log('[envprobe:$tag] 唤醒=$wake 内存可用=${m['MA'] ?? '?'}KB '
           'Dirty=${m['DIRTY'] ?? '?'}KB swap=${m['SWF'] ?? '?'}KB '
           '进程=${m['NPROC'] ?? '?'} 内存前三(仅参考·不会被杀)=${m['TOP'] ?? '?'}');

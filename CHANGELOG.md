@@ -1,5 +1,43 @@
 # 变更记录
 
+## v1.0.18 — 2026-10-29
+> 触发：一台同内核镜像的 HONOR BKQ-AN10 用户提供了 2026-10-28/29 两轮完整历史日志复盘。
+> 成功轮（10-28 深夜）里 permissive 第 1 发失败、第 2 发命中；失败轮里 phase1 在 42°C 开打后
+> 日志中断。结合 docs/04-benchmark.md 的既有统计（单发 panic ≈14%，整轮 panic 概率是发数的函数）
+> 定下优化方向：**不改任何 exploit 参数**（issue #6 未验证清单一条不碰），只消灭「白发」和
+> 「竞态窗口里的自干扰」。改动全部在 Dart 编排层，原生载荷零改动。
+
+- **★ 修心跳定时器违背「跑链期间彻底静默」（panic 率主嫌疑）**
+  v1.0.17 把 3s/5s 轮询全砍了，结论写在 CHANGELOG（重活抢页 ⇒ panic 12%→100%），
+  但 20s 心跳里还留着 `refreshHealth(force: true)`——`force` 恰好绕过了给 `refreshHealth`
+  加的 `running` 早退。等于一发 shot（50–200s）期间每 20s 跑一次
+  `dumpsys power + slabinfo + meminfo + getenforce + /proc/modules + ls×4`，
+  外加 `_prepCmd()` 的 `input tap` 与 4 条 settings put。这正是 v1.0.17 自己定性为
+  「真凶」的那类活动。现在：
+  · 新增 `_shotInFlight` 标志包住每一次 x645 调用（permissive 与 _runShot）；
+  · shot 在飞 ⇒ 心跳**什么都不发**（零 shell 流量）；
+  · shot 间隙 ⇒ 只发一条 `input keyevent 224`（保活）。常亮/亮度/30min 屏幕超时在开局
+    与每发前的 prep 里已设置，覆盖整轮，无需每 20s 重写 settings，更不需要 tap。
+- **★ 新增载体自检（F_SETPIPE_SZ EPERM ⇒ 停止盲重试）**
+  docs/04-benchmark.md §7：`F_SETPIPE_SZ` 的 EPERM 不报错到 UI，载体静默退化成 8KB ⇒
+  落位近乎必败。原逻辑失败后照原条件原样重发——条件不会自己变好，每一发都是白发
+  （还各背 ~14% panic）。现在每发后 grep 原生日志：
+  · permissive：连续 2 发 EPERM ⇒ 本轮停止，报针对性原因（管道页预算被占）与对策
+    （重启释放预算 / 开「开打前清理后台」），不再烧剩下的发数；
+  · phase1/phase2：每发 EPERM 都在日志里 `[carrier:*]` 高亮告警。
+- **★ 判据生产者（pc）存活检查**
+  docs §9.2 的老坑：pc 是 CAPBND_ZERO/CAPEFF_OK/ROOT_OK 的唯一打印者兼模块加载者，
+  它退出后继续重打永远拿不到判据。现在 phase1/phase2 的 verdict 轮询超时后先
+  `pgrep -x pc`：pc 没了 ⇒ 立即判失败并说明原因（重新点开始会在 ② 重启探针），
+  不再白发剩下的发数。
+- **shot 超时 300s → 360s**：phase1 tries=8 名义 ~200s（§8.1：try=0 约 50s、每次内部重试
+  +21s），热机降频再拉长就贴着 300s 上限；超时会 destroy 掉竞态中途的 sh。360s 给足裕量。
+- **建议引擎两条新触发**：① 本轮出现过载体 EPERM ⇒ 建议重启/开清理后台；
+  ② 环境探针进程数 ≥1000（2026-10-29 实测 1156/1189，内存前三常是微信）⇒
+  建议打开默认关闭的「开打前清理后台」。
+- **验证**：`flutter analyze` 0 issue；日志侧核对——成功轮的 `[verdict]`/`[clean]`/
+  `[ksu]` 各判据行均能被新逻辑正确归类；BRT/BKQ 等同镜像机型的既有流程不受影响。
+
 ## v1.0.17 — 2026-10-26
 - **★ 开打前预建管道数 20000 → 512（真机 A/B：落位率 63% → 88%）**：
   uid 2000 的管道页预算 = `pipe-user-pages-soft` = 16384 页（64MB）。原来预建 20000 个 pipe

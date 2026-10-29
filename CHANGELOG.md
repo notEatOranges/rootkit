@@ -1,5 +1,11 @@
 # 变更记录
 
+## v1.0.20 — 2026-10-29
+- **沉浸式系统栏（用户反馈：底部手势条区域是白色安全边距，看着别扭）**：
+  `main()` 里开 `SystemUiMode.edgeToEdge`，状态栏/导航栏全透明 + 亮色图标/手势条，
+  并设 `systemNavigationBarContrastEnforced=false`（Android 10+ 不再自动垫白）。
+  内容布局本就包在 `SafeArea` 里，不会被手势条压住；顶部观感不变、底部与主题同色。
+
 ## v1.0.19 — 2026-10-29
 - **新增【实验性，默认关】选项「跑链保活心跳」**（用户需求：把 PC 侧 adb 监听搬进 App）：
   背景：2026-10-29 BKQ-AN10 上，唯一一轮开着 PC 侧 adb 心跳（20s 一条 `getenforce`+`uptime`

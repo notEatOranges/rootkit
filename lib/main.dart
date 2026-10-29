@@ -16,6 +16,19 @@ import 'updater.dart';
 const String kRepoUrl = 'https://github.com/No-World/rootkit';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // 沉浸式：内容画到状态栏/手势条底下，系统栏全透明；
+  // 暗色主题 ⇒ 状态栏与手势条都用亮色图标；关掉 Android 10+ 的"对比度强制垫白"，
+  // 否则底部手势条区域会是一条白色安全边距（截图反馈过）。
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: Colors.transparent,
+    systemNavigationBarDividerColor: Colors.transparent,
+    systemNavigationBarIconBrightness: Brightness.light,
+    systemNavigationBarContrastEnforced: false,
+  ));
   runApp(const RootKitApp());
 }
 
